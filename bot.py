@@ -255,7 +255,7 @@ def get_telegram_signal(df, symbol):
 
     open_time = row["Open_time"].strftime("%Y-%m-%d %H:%M")
     close     = row["Close"]
-    signal    = row["Finall"]
+    signal    = row["Final"]
     rsi       = round(row["RSI"], 2) if "RSI" in df.columns else "N/A"
 
     # =========================
