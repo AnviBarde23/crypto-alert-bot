@@ -15,13 +15,11 @@ CHAT_IDS = [
     # "2037873693"
 ]
 
+
 SYMBOL     ="ETHUSDT"
 IST        = pytz.timezone("Asia/Kolkata")
 
 last_signal = None  # in-memory; resets on restart
-
-print(f"[CONFIG] Symbol: {SYMBOL}")
-print(f"[CONFIG] Chat IDs loaded: {len(CHAT_IDS)}")
 
 def send_message(text):
     """Send a message to all configured Telegram chat IDs."""
@@ -37,7 +35,8 @@ def send_message(text):
             print(f"[TELEGRAM] Message sent to {chat_id.strip()}")
         except Exception as e:
             print(f"[ERROR] Telegram failed for {chat_id}: {e}")
-            
+
+
 def calculate_rsi(series, length=14):
     """
     Wilder's RSI using EWM (alpha = 1/length).
@@ -51,166 +50,199 @@ def calculate_rsi(series, length=14):
     rs       = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def fetch_candles(symbol=SYMBOL, resolution="30m", lookback_candles=200):
-    """Fetch OHLCV candles from Delta Exchange API."""
-    end   = int(time.time())
-    start = end - lookback_candles * 1800
+def fetch_candles(symbol=SYMBOL, resolution="30m", lookback_candles=500):
+    # Mapping resolution to seconds for dynamic start time
+    res_in_seconds = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+    delta_seconds = res_in_seconds.get(resolution, 1800)
+    
+    end = int(time.time())
+    start = end - (lookback_candles * delta_seconds)
 
-    resp = requests.get(
-        "https://api.delta.exchange/v2/history/candles",
-        params={"symbol": symbol, "resolution": resolution, "start": start, "end": end},
-        timeout=15
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.get(
+            "https://api.delta.exchange/v2/history/candles",
+            params={
+                "symbol": symbol, 
+                "resolution": resolution, 
+                "start": start, 
+                "end": end
+            },
+            timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
-    if "result" not in data or not data["result"]:
-        raise ValueError("No candle data returned from API")
+        if not data.get("result"):
+            print(f"Warning: No data for {symbol}")
+            return pd.DataFrame()
 
-    df = pd.DataFrame(data["result"])
-    df.rename(columns={
-        "time": "Open_time", "open": "Open", "high": "High",
-        "low": "Low", "close": "Close", "volume": "Volume"
-    }, inplace=True)
+        df = pd.DataFrame(data["result"])
+        
+        # Column mapping and type conversion
+        df = df.rename(columns={
+            "time": "Open_time", "open": "Open", "high": "High",
+            "low": "Low", "close": "Close", "volume": "Volume"
+        })
 
-    df["Open_time"] = (
-        pd.to_datetime(df["Open_time"], unit='s')
-        .dt.tz_localize("UTC")
-        .dt.tz_convert("Asia/Kolkata")
-        .dt.tz_localize(None)
-    )
-    df = df.sort_values("Open_time").reset_index(drop=True)
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = df[col].astype(float)
+        # Timezone conversion: UTC -> IST -> Naive
+        df["Open_time"] = (
+            pd.to_datetime(df["Open_time"], unit='s', utc=True)
+            .dt.tz_convert("Asia/Kolkata")
+            .dt.tz_localize(None)
+        )
+        
+        # Sort and clean
+        df = df.sort_values("Open_time").drop_duplicates().reset_index(drop=True)
+        numeric_cols = ["Open", "High", "Low", "Close", "Volume"]
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
-    print(f"[FETCH] {len(df)} candles loaded. Latest: {df['Open_time'].iloc[-1]}")
-    return df
+        return df
 
-def compute_new_signal(df):
-    df = df.copy()
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return pd.DataFrame()
 
-    # =========================
-    # 📊 INDICATORS
-    # =========================
+def calculate_indicators(df):
+    """
+    Applies technical indicators to the OHLCV DataFrame.
+    Expects columns: 'High', 'Low', 'Close'
+    """
+    if df.empty or len(df) < 60:
+        print("[WARN] Not enough data to calculate 60-period indicators.")
+        return df
+
+    # 1. HLC3 (Typical Price)
     df["hlc3"] = (df["High"] + df["Low"] + df["Close"]) / 3
 
-    df["ma"] = df["hlc3"].rolling(60).mean()
+    # 2. Moving Average (SMA 60)
+    df["ma"] = df["hlc3"].rolling(window=60).mean()
 
-    df["mean_dev"] = df["hlc3"].rolling(60).apply(
+    # 3. Mean Deviation (for CCI)
+    # Optimized: calculates the mean of absolute differences from the mean
+    df["mean_dev"] = df["hlc3"].rolling(window=60).apply(
         lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
     )
 
+    # 4. CCI (Commodity Channel Index) 
+    # Formula: (Price - SMA) / (0.015 * Mean Deviation)
     df["CCI_60"] = (df["hlc3"] - df["ma"]) / (0.015 * df["mean_dev"])
 
+    # 5. CCI Smoothing & Difference
     df["CCI_EMA"] = df["CCI_60"].ewm(span=7, adjust=False).mean()
-
     df["Diff_CCI"] = df["CCI_60"] - df["CCI_EMA"]
 
+    # 6. Trend & Momentum
     df["EMA7"] = df["Close"].ewm(span=7, adjust=False).mean()
+    df["RSI"] = calculate_rsi(df["Close"], length=14)
 
-    df["RSI"] = calculate_rsi(df["Close"])
+    return df
 
-    # =========================
-    # 🎯 FINAL SIGNAL LOGIC
-    # =========================
+def generate_signals(df):
+    """
+    Analyzes the DataFrame to add a 'Signal' column.
+    1. Triggers 'Long/Short Trade' on crossovers with a 2-unit spread.
+    2. Maintains the signal status as long as price/momentum stay on the right side of EMA.
+    """
+    df["Signal"] = "No Trade"
 
-    signals = []
-    current_position = None  # 🔥 Tracks ongoing state
+    for i in range(1, len(df)):
+        # --- DATA FETCHING ---
+        curr_close = df.loc[i, "Close"]
+        curr_ema7  = df.loc[i, "EMA7"]
+        curr_cci   = df.loc[i, "CCI_60"]
+        curr_cci_e = df.loc[i, "CCI_EMA"]
 
-    for i in range(len(df)):
-        if i == 0:
-            signals.append("No Trade")
-            continue
+        prev_close = df.loc[i-1, "Close"]
+        prev_ema7  = df.loc[i-1, "EMA7"]
+        prev_cci   = df.loc[i-1, "CCI_60"]
+        prev_cci_e = df.loc[i-1, "CCI_EMA"]
+        
+        # Previous state
+        prev_signal = df.loc[i-1, "Signal"]
+        
+        price_ema_diff = curr_close - curr_ema7
 
-        # Current values
-        close = df["Close"].iloc[i]
-        ema = df["EMA7"].iloc[i]
-        cci = df["CCI_60"].iloc[i]
-        cci_ema = df["CCI_EMA"].iloc[i]
+        # --- 1. CONTINUATION LOGIC ---
+        # If we were already in a Long, stay in Long as long as conditions hold
+        if prev_signal == "Long Trade":
+            if curr_close > curr_ema7 and curr_cci > curr_cci_e:
+                df.loc[i, "Signal"] = "Long Trade"
+                continue # Skip to next candle, no need to check for new entries
 
-        # =========================
-        # 🧊 FREEZE CONDITION 
-        # =========================
-        if abs(close - ema) < 2:
-            signals.append(signals[-1])   # keep previous signal
-            continue
+        # If we were already in a Short, stay in Short as long as conditions hold
+        elif prev_signal == "Short Trade":
+            if curr_close < curr_ema7 and curr_cci < curr_cci_e:
+                df.loc[i, "Signal"] = "Short Trade"
+                continue # Skip to next candle
 
-        # Previous values
-        prev_close = df["Close"].iloc[i-1]
-        prev_ema = df["EMA7"].iloc[i-1]
-        prev_cci = df["CCI_60"].iloc[i-1]
-        prev_cci_ema = df["CCI_EMA"].iloc[i-1]
+        # --- 2. NEW ENTRY LOGIC (If no active continuation) ---
+        # LONG ENTRY
+        if (prev_close < prev_ema7 and prev_cci < prev_cci_e) and \
+           (curr_close > curr_ema7 and curr_cci > curr_cci_e) and \
+           (price_ema_diff >= 2):
+            df.loc[i, "Signal"] = "Long Trade"
 
-        # =========================
-        # 🔄 CONTINUATION LOGIC FIRST
-        # =========================
+        # SHORT ENTRY
+        elif (prev_close > prev_ema7 and prev_cci > prev_cci_e) and \
+             (curr_close < curr_ema7 and curr_cci < curr_cci_e) and \
+             (price_ema_diff <= -2):
+            df.loc[i, "Signal"] = "Short Trade"
 
-        # Continue LONG
-        if current_position == "Long Trade":
-            if close > ema and cci > cci_ema:
-                signals.append("Long Trade")
-                continue
-            else:
-                current_position = None  # exit
+    return df
 
-        # Continue SHORT
-        elif current_position == "Short Trade":
-            if close < ema and cci < cci_ema:
-                signals.append("Short Trade")
-                continue
-            else:
-                current_position = None  # exit
+def generate_fake_signals(df):
+    """
+    Identifies 'Fake' trade setups where momentum (CCI) was bullish/bearish 
+    for 3 candles while price stayed on the wrong side of EMA7, 
+    plus a minimum 2-unit distance check on the breakout candle.
+    """
+    df["Fake Signal"] = "No Trade"
 
-        # =========================
-        # 🟢 LONG TRADE (NEW ENTRY)
-        # =========================
-        if (prev_close < prev_ema and prev_cci < prev_cci_ema) and \
-           (close > ema and cci > cci_ema):
+    # Start from index 3 to allow for 3 lookback candles (i-1, i-2, i-3)
+    for i in range(3, len(df)):
+        # Current Candle
+        curr_close = df.loc[i, "Close"]
+        curr_ema7  = df.loc[i, "EMA7"]
+        curr_cci   = df.loc[i, "CCI_60"]
+        curr_cci_e = df.loc[i, "CCI_EMA"]
+        
+        # Spread calculation
+        price_ema_diff = curr_close - curr_ema7
 
-            signals.append("Long Trade")
-            current_position = "Long Trade"
+        # Lookback Window: indices [i-3, i-2, i-1] (Last 3 candles)
+        lookback = df.loc[i-3 : i-1]
 
-        # =========================
-        # 🔴 SHORT TRADE (NEW ENTRY)
-        # =========================
-        elif (prev_close > prev_ema and prev_cci > prev_cci_ema) and \
-             (close < ema and cci < cci_ema):
+        # --- LONG FAKE TRADE CONDITION ---
+        # Lookback: CCI was strong but Price was stuck below EMA7
+        long_fake_setup = (
+            (lookback["Close"] < lookback["EMA7"]).all() and 
+            (lookback["CCI_60"] > lookback["CCI_EMA"]).all()
+        )
+        
+        # Current: Price breaks above EMA7 by at least 2 units
+        if (curr_close > curr_ema7 and curr_cci > curr_cci_e) and \
+           long_fake_setup and (price_ema_diff >= 2):
+            df.loc[i, "Fake Signal"] = "Long Fake Trade"
 
-            signals.append("Short Trade")
-            current_position = "Short Trade"
+        # --- SHORT FAKE TRADE CONDITION ---
+        # Lookback: CCI was weak but Price was stuck above EMA7
+        short_fake_setup = (
+            (lookback["Close"] > lookback["EMA7"]).all() and 
+            (lookback["CCI_60"] < lookback["CCI_EMA"]).all()
+        )
 
-        # =========================
-        # 🟢 LONG FAKE TRADE
-        # =========================
-        elif (close > ema and cci > cci_ema):
-            if i >= 3 and all(
-                df["CCI_60"].iloc[j] > df["CCI_EMA"].iloc[j]
-                for j in range(i-3, i)
-            ):
-                signals.append("Long Fake Trade")
-            else:
-                signals.append("No Trade")
+        # Current: Price breaks below EMA7 by at least 2 units
+        if (curr_close < curr_ema7 and curr_cci < curr_cci_e) and \
+           short_fake_setup and (price_ema_diff <= -2):
+            df.loc[i, "Fake Signal"] = "Short Fake Trade"
 
-        # =========================
-        # 🔴 SHORT FAKE TRADE
-        # =========================
-        elif (close < ema and cci < cci_ema):
-            if i >= 3 and all(
-                df["CCI_60"].iloc[j] < df["CCI_EMA"].iloc[j]
-                for j in range(i-3, i)
-            ):
-                signals.append("Short Fake Trade")
-            else:
-                signals.append("No Trade")
+    return df
 
-        # =========================
-        # ❌ NO TRADE
-        # =========================
-        else:
-            signals.append("No Trade")
-
-    df["Final_Signal"] = signals
-
+def final(df):
+    df["Final"] = df.apply(
+        lambda row: row["Signal"] if row["Fake Signal"] == "No Trade" else row["Fake Signal"],
+        axis=1
+    )
     return df
 
 def get_telegram_signal(df, symbol):
@@ -223,7 +255,7 @@ def get_telegram_signal(df, symbol):
 
     open_time = row["Open_time"].strftime("%Y-%m-%d %H:%M")
     close     = row["Close"]
-    signal    = row["Final_Signal"]
+    signal    = row["Finall"]
     rsi       = round(row["RSI"], 2) if "RSI" in df.columns else "N/A"
 
     # =========================
@@ -268,7 +300,7 @@ def run_signal_check():
     # 📥 Fetch Data
     # =========================
     try:
-        df = fetch_candles()
+        df = fetch_candles(SYMBOL)
     except Exception as e:
         print(f"[ERROR] API fetch failed: {e}")
         return
@@ -276,12 +308,15 @@ def run_signal_check():
     # =========================
     # ⚙️ Compute Indicators + Signals
     # =========================
-    df = compute_new_signal(df)
+    df1 = calculate_indicators(df)
+    df2 = generate_signals(df1)
+    df3 =generate_fake_signals(df2)
+    df_final = final(df3)
 
     # =========================
     # 📡 Get Telegram Message
     # =========================
-    signal, msg = get_telegram_signal(df, SYMBOL)
+    signal, msg = get_telegram_signal(df_final, SYMBOL)
 
     row = df.iloc[-1]
     open_time = row["Open_time"].strftime("%Y-%m-%d %H:%M")
