@@ -162,19 +162,6 @@ def generate_signals(df):
         
         price_ema_diff = curr_close - curr_ema7
 
-        # --- 1. CONTINUATION LOGIC ---
-        # If we were already in a Long, stay in Long as long as conditions hold
-        if prev_signal == "Long Trade":
-            if curr_close > curr_ema7 and curr_cci > curr_cci_e:
-                df.loc[i, "Signal"] = "Long Trade"
-                continue # Skip to next candle, no need to check for new entries
-
-        # If we were already in a Short, stay in Short as long as conditions hold
-        elif prev_signal == "Short Trade":
-            if curr_close < curr_ema7 and curr_cci < curr_cci_e:
-                df.loc[i, "Signal"] = "Short Trade"
-                continue # Skip to next candle
-
         # --- 2. NEW ENTRY LOGIC (If no active continuation) ---
         # LONG ENTRY
         if (prev_close < prev_ema7 and prev_cci < prev_cci_e) and \
@@ -187,6 +174,19 @@ def generate_signals(df):
              (curr_close < curr_ema7 and curr_cci < curr_cci_e) and \
              (price_ema_diff <= -2):
             df.loc[i, "Signal"] = "Short Trade"
+                 
+        # --- 1. CONTINUATION LOGIC ---
+        # If we were already in a Long, stay in Long as long as conditions hold
+        if prev_signal == "Long Trade":
+            if curr_close > curr_ema7 and curr_cci > curr_cci_e:
+                df.loc[i, "Signal"] = "Long Trade"
+                continue # Skip to next candle, no need to check for new entries
+
+        # If we were already in a Short, stay in Short as long as conditions hold
+        elif prev_signal == "Short Trade":
+            if curr_close < curr_ema7 and curr_cci < curr_cci_e:
+                df.loc[i, "Signal"] = "Short Trade"
+                continue # Skip to next candle
 
     return df
 
