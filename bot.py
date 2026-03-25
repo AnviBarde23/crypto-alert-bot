@@ -188,6 +188,7 @@ def generate_signals(df):
                 df.loc[i, "Signal"] = "Short Trade"
                 continue # Skip to next candle
 
+
     return df
 
 def generate_fake_signals(df):
